@@ -1,10 +1,10 @@
-
+import os
 import telebot
 from telebot import types  # клавиатуры
 import time
 
 # 👉 ВСТАВЬ СЮДА СВОЙ ТОКЕН
-TOKEN = "8401776638:AAHOKWF0qm0oxI96Udg4fjkO5VKyoPkKLDc"
+TOKEN = os.getenv("TOKEN")
 
 bot = telebot.TeleBot(TOKEN, parse_mode="HTML")
 

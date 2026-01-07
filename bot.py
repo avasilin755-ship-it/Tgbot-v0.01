@@ -3,10 +3,15 @@ import telebot
 from telebot import types  # клавиатуры
 import time
 
-# 👉 ВСТАВЬ СЮДА СВОЙ ТОКЕН ЧЕРЕЗ ПЕРЕМЕННУЮ ОКРУЖЕНИЯ
+# 👉 Токен берём из переменной окружения
 TOKEN = os.getenv("TOKEN")
 
 bot = telebot.TeleBot(TOKEN, parse_mode="HTML")
+
+# ---------- НАСТРОЙКИ РЕФЕРАЛКИ ----------
+REF_VIP_THRESHOLD = 3  # сколько приглашений нужно, чтобы показывать "VIP-очередь"
+
+# ---------- ОСНОВНЫЕ СТРУКТУРЫ ДАННЫХ ----------
 
 # Очередь ожидающих пользователей
 waiting_users = []  # список user_id
@@ -38,6 +43,10 @@ user_dislikes_received = {}  # user_id -> int
 
 # Последняя активность пользователя (для "онлайн"): user_id -> timestamp
 last_seen = {}
+
+# Рефералка: кто кого привёл и сколько людей пригласил
+ref_inviter = {}        # user_id -> inviter_id
+ref_count = {}          # inviter_id -> int (сколько он привёл)
 
 # Простейший список слов для фильтрации порнографического контента
 BAD_WORDS = [
@@ -76,10 +85,12 @@ def main_keyboard():
     btn_help = types.KeyboardButton("ℹ️ Помощь")
     btn_profile = types.KeyboardButton("👤 Профиль")
     btn_stats = types.KeyboardButton("📊 Статистика")
+    btn_bonus = types.KeyboardButton("🎁 Бонусы")
     kb.row(btn_any)
     kb.row(btn_m, btn_f)
     kb.row(btn_stop, btn_help)
     kb.row(btn_profile, btn_stats)
+    kb.row(btn_bonus)
     return kb
 
 
@@ -190,8 +201,20 @@ def start_search(user_id, chat_id, mode=None):
         bot.send_message(chat_id, "✅ Собеседник найден! Можете писать, отправлять фото и позже медиа.")
         bot.send_message(partner_id, "✅ Собеседник найден! Можете писать, отправлять фото и позже медиа.")
     else:
+        # 👉 Очередь всегда обычная,
+        # но пользователям с большим количеством приглашений мы показываем "VIP-очередь" в тексте.
         waiting_users.append(user_id)
-        bot.send_message(chat_id, "Вы в очереди. Как только появится подходящий собеседник — я соединю вас.")
+        invites = ref_count.get(user_id, 0)
+        if invites >= REF_VIP_THRESHOLD:
+            bot.send_message(
+                chat_id,
+                "🚀 Вы в <b>VIP-очереди</b>! Как только появится подходящий собеседник — я постараюсь соединить вас как можно быстрее 😉"
+            )
+        else:
+            bot.send_message(
+                chat_id,
+                "Вы в очереди. Как только появится подходящий собеседник — я соединю вас."
+            )
 
 
 def gender_to_text(g):
@@ -260,12 +283,115 @@ def send_rate_request(user_id):
     )
 
 
+def send_bonus_info(user_id, chat_id):
+    """Информация о реферальной ссылке и приглашениях."""
+    invites = ref_count.get(user_id, 0)
+    likes = user_likes_received.get(user_id, 0)
+    dislikes = user_dislikes_received.get(user_id, 0)
+
+    try:
+        bot_info = bot.get_me()
+        username = bot_info.username
+    except Exception:
+        username = "your_bot"
+
+    ref_link = f"https://t.me/{username}?start={user_id}"
+
+    vip = invites >= REF_VIP_THRESHOLD
+    vip_status = "✅ У вас активирован <b>VIP-статус</b> в очереди." if vip else \
+        f"Чтобы получить <b>VIP-очередь</b>, пригласите ещё <b>{max(REF_VIP_THRESHOLD - invites, 1)}</b> человек(а)."
+
+    text = (
+        "🎁 <b>Бонусы и приглашения</b>\n\n"
+        "Поделитесь этой ссылкой, чтобы друзья заходили в чат по вашей рефералке:\n"
+        f"<code>{ref_link}</code>\n\n"
+        f"Вы уже пригласили: <b>{invites}</b> человек(а).\n"
+        "За каждого приглашённого вам добавляется +1 👍 к рейтингу.\n\n"
+        f"{vip_status}\n\n"
+        f"Ваш текущий рейтинг: 👍 <b>{likes}</b> / 👎 <b>{dislikes}</b>"
+    )
+
+    bot.send_message(chat_id, text, reply_markup=main_keyboard())
+
+
+def send_leaderboard(chat_id, current_user_id):
+    """Лидерборд по приглашениям."""
+    if not ref_count:
+        bot.send_message(
+            chat_id,
+            "🏆 Пока никто никого не пригласил.\n"
+            "Станьте первым — используйте /bonus и делитесь ссылкой!",
+            reply_markup=main_keyboard()
+        )
+        return
+
+    # сортируем по количеству приглашений
+    sorted_refs = sorted(ref_count.items(), key=lambda kv: kv[1], reverse=True)
+    top_n = sorted_refs[:10]
+
+    lines = ["🏆 <b>Топ-10 по приглашениям</b>\n"]
+    position_of_user = None
+
+    # строим общий список для поиска позиции текущего пользователя
+    for idx, (uid, cnt) in enumerate(sorted_refs, start=1):
+        if uid == current_user_id:
+            position_of_user = (idx, cnt)
+            break
+
+    for rank, (uid, cnt) in enumerate(top_n, start=1):
+        marker = ""
+        if uid == current_user_id:
+            marker = "  <b>(это вы)</b>"
+        medal = "🥇" if rank == 1 else "🥈" if rank == 2 else "🥉" if rank == 3 else f"{rank}."
+        lines.append(f"{medal} ID <code>{uid}</code> — <b>{cnt}</b> приглашений{marker}")
+
+    if position_of_user is None:
+        me_line = "\nВы пока не в топе. Приглашайте друзей через /bonus!"
+    else:
+        pos, cnt = position_of_user
+        me_line = (
+            f"\n📌 Ваша позиция: <b>#{pos}</b> с <b>{cnt}</b> приглашениями.\n"
+            "Продолжайте — легко ворваться в топ!"
+        )
+
+    text = "\n".join(lines) + me_line
+
+    bot.send_message(chat_id, text, reply_markup=main_keyboard())
+
+
 # ---------- КОМАНДЫ ----------
 
 @bot.message_handler(commands=["start"])
 def handle_start(message):
     user_id = message.from_user.id
     touch_user(user_id)
+
+    # --- РЕФЕРАЛЬНАЯ ЛОГИКА ---
+    parts = message.text.split(maxsplit=1)
+    if len(parts) > 1:
+        payload = parts[1]
+        try:
+            inviter_id = int(payload)
+            # не считаем самоприглашение и не переписываем, если уже есть пригласивший
+            if inviter_id != user_id and user_id not in ref_inviter:
+                ref_inviter[user_id] = inviter_id
+                ref_count[inviter_id] = ref_count.get(inviter_id, 0) + 1
+                # за приглашение добавляем +1 лайк к рейтингу
+                user_likes_received[inviter_id] = user_likes_received.get(inviter_id, 0) + 1
+
+                invites = ref_count[inviter_id]
+                try:
+                    bot.send_message(
+                        inviter_id,
+                        "🎉 <b>По вашей ссылке пришёл новый человек!</b>\n"
+                        f"Всего приглашений: <b>{invites}</b>.\n"
+                        "Спасибо, что помогаете чату расти ❤️"
+                    )
+                except Exception:
+                    # если не можем написать пригласившему — просто молчим
+                    pass
+        except ValueError:
+            pass
 
     if user_id not in user_gender or user_id not in user_age:
         # новый или неполный профиль
@@ -287,7 +413,8 @@ def handle_start(message):
             message.chat.id,
             "С возвращением! 👋\n\n"
             "Используйте кнопки снизу для поиска собеседника.\n"
-            "Команда /profile покажет ваш профиль.",
+            "Команда /profile покажет ваш профиль.\n"
+            "Команда /bonus — ваша личная ссылка и бонусы.",
             reply_markup=main_keyboard()
         )
 
@@ -338,7 +465,9 @@ def handle_help(message):
         "👩 Искать девушку — искать только девушек\n"
         "⛔ Стоп — завершить разговор или выйти из очереди\n"
         "👤 Профиль /profile — посмотреть и изменить пол/возраст\n"
-        "📊 Статистика — онлайн, очередь, активные чаты и ваш рейтинг\n\n"
+        "📊 Статистика — онлайн, очередь, активные чаты и ваш рейтинг\n"
+        "🎁 /bonus — ваша личная приглашалка и бонусы\n"
+        "🏆 /top — лидерборд по приглашениям\n\n"
         "После завершения чата можно оценить собеседника 👍👎\n\n"
         "Первые 30 секунд диалога нельзя отправлять стикеры, GIF и видео.\n"
         "Запрещён порнографический контент.",
@@ -354,6 +483,7 @@ def handle_profile(message):
     a = user_age.get(user_id)
     likes = user_likes_received.get(user_id, 0)
     dislikes = user_dislikes_received.get(user_id, 0)
+    invites = ref_count.get(user_id, 0)
 
     text = "👤 <b>Ваш профиль</b>\n\n"
     text += f"Пол: <b>{g}</b>\n"
@@ -363,13 +493,29 @@ def handle_profile(message):
         text += "Возраст: <b>не указан</b>\n"
 
     text += f"Рейтинг: 👍 <b>{likes}</b> / 👎 <b>{dislikes}</b>\n"
-    text += "\nВы можете изменить пол или возраст кнопками ниже."
+    text += f"Приглашено друзей: <b>{invites}</b>\n"
+    text += "\nВы можете изменить пол или возраст кнопками ниже.\n"
+    text += "А в /bonus — ваша личная пригласительная ссылка."
 
     bot.send_message(
         message.chat.id,
         text,
         reply_markup=profile_keyboard()
     )
+
+
+@bot.message_handler(commands=["bonus"])
+def handle_bonus(message):
+    user_id = message.from_user.id
+    touch_user(user_id)
+    send_bonus_info(user_id, message.chat.id)
+
+
+@bot.message_handler(commands=["top"])
+def handle_top(message):
+    user_id = message.from_user.id
+    touch_user(user_id)
+    send_leaderboard(message.chat.id, user_id)
 
 
 # ---------- ВЫБОР ПОЛА (кнопки) ----------
@@ -476,7 +622,7 @@ def handle_text(message):
             )
         return
 
-    # --- кнопки поиска/меню/профиля/статистики ---
+    # --- кнопки поиска/меню/профиля/статистики/бонусов ---
     if text == "🔍 Найти собеседника":
         start_search(user_id, message.chat.id, mode=None)
         return
@@ -497,6 +643,9 @@ def handle_text(message):
         return
     if text == "📊 Статистика":
         send_stats(user_id, message.chat.id)
+        return
+    if text == "🎁 Бонусы":
+        send_bonus_info(user_id, message.chat.id)
         return
     if text == "🔄 Изменить пол":
         bot.send_message(
@@ -625,5 +774,5 @@ def handle_video_or_gif(message):
 
 
 if __name__ == "__main__":
-    print("Бот запущен (анонимный чат + пол + возраст + профиль + рейтинг + статистика)...")
+    print("Бот запущен (анонимный чат + профиль + рейтинг + статистика + рефералка + лидерборд)...")
     bot.infinity_polling()

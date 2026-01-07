@@ -331,6 +331,14 @@ def handle_text(message):
     user_id = message.from_user.id
     text = message.text
 
+    # <<< НОВОЕ: не трогаем команды, пусть их обрабатывают /start, /profile и т.д.
+    if text.startswith("/"):
+        return
+
+    # <<< НОВОЕ: не обрабатываем тут кнопки выбора пола, для них есть отдельный хендлер
+    if text in ["👨 Я парень", "👩 Я девушка"]:
+        return
+
     # --- сначала проверяем, не ждём ли мы возраст ---
     if user_id in waiting_for_age:
         if text.isdigit():

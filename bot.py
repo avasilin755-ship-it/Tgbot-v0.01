@@ -3,7 +3,7 @@ import telebot
 from telebot import types  # клавиатуры
 import time
 
-# 👉 ВСТАВЬ СЮДА СВОЙ ТОКЕН
+# 👉 ВСТАВЬ СЮДА СВОЙ ТОКЕН ЧЕРЕЗ ПЕРЕМЕННУЮ ОКРУЖЕНИЯ
 TOKEN = os.getenv("TOKEN")
 
 bot = telebot.TeleBot(TOKEN, parse_mode="HTML")
@@ -29,6 +29,16 @@ waiting_for_age = set()
 # Время начала текущего чата: user_id -> timestamp
 chat_start_time = {}
 
+# Последний собеседник (для оценки): user_id -> last_partner_id
+last_partner = {}
+
+# Рейтинг: сколько лайков/дизлайков получил пользователь
+user_likes_received = {}     # user_id -> int
+user_dislikes_received = {}  # user_id -> int
+
+# Последняя активность пользователя (для "онлайн"): user_id -> timestamp
+last_seen = {}
+
 # Простейший список слов для фильтрации порнографического контента
 BAD_WORDS = [
     "porn", "sex", "nude", "xxx",
@@ -39,6 +49,11 @@ BAD_WORDS = [
 
 
 # ---------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ----------
+
+def touch_user(user_id):
+    """Обновляем время последней активности пользователя."""
+    last_seen[user_id] = time.time()
+
 
 def get_partner(user_id):
     return pairs.get(user_id)
@@ -60,10 +75,11 @@ def main_keyboard():
     btn_stop = types.KeyboardButton("⛔ Стоп")
     btn_help = types.KeyboardButton("ℹ️ Помощь")
     btn_profile = types.KeyboardButton("👤 Профиль")
+    btn_stats = types.KeyboardButton("📊 Статистика")
     kb.row(btn_any)
     kb.row(btn_m, btn_f)
     kb.row(btn_stop, btn_help)
-    kb.row(btn_profile)
+    kb.row(btn_profile, btn_stats)
     return kb
 
 
@@ -205,11 +221,51 @@ def contains_bad_words(text: str) -> bool:
     return False
 
 
+def send_stats(user_id, chat_id):
+    """Отправка статистики: онлайн, очередь, активные чаты, рейтинг пользователя."""
+    now = time.time()
+    # онлайн считаем как активность за последние 10 минут
+    online = sum(1 for ts in last_seen.values() if now - ts < 600)
+    in_queue = len(waiting_users)
+    active_chats = len(pairs) // 2
+    total_users = len(user_gender)
+
+    likes = user_likes_received.get(user_id, 0)
+    dislikes = user_dislikes_received.get(user_id, 0)
+
+    text = (
+        "📊 <b>Статистика</b>\n\n"
+        f"Онлайн (за последние 10 минут): <b>{online}</b>\n"
+        f"Сейчас в очереди: <b>{in_queue}</b>\n"
+        f"Активных чатов: <b>{active_chats}</b>\n"
+        f"Всего пользователей: <b>{total_users}</b>\n\n"
+        f"Ваш рейтинг: 👍 <b>{likes}</b> / 👎 <b>{dislikes}</b>"
+    )
+
+    bot.send_message(chat_id, text, reply_markup=main_keyboard())
+
+
+def send_rate_request(user_id):
+    """Отправляем пользователю запрос оценить собеседника."""
+    if user_id not in last_partner:
+        return
+    kb = types.InlineKeyboardMarkup()
+    btn_like = types.InlineKeyboardButton("👍 Нравился", callback_data="rate_like")
+    btn_dislike = types.InlineKeyboardButton("👎 Не очень", callback_data="rate_dislike")
+    kb.add(btn_like, btn_dislike)
+    bot.send_message(
+        user_id,
+        "Оцените собеседника:",
+        reply_markup=kb
+    )
+
+
 # ---------- КОМАНДЫ ----------
 
 @bot.message_handler(commands=["start"])
 def handle_start(message):
     user_id = message.from_user.id
+    touch_user(user_id)
 
     if user_id not in user_gender or user_id not in user_age:
         # новый или неполный профиль
@@ -239,16 +295,26 @@ def handle_start(message):
 @bot.message_handler(commands=["stop"])
 def handle_stop(message):
     user_id = message.from_user.id
+    touch_user(user_id)
     partner_id = get_partner(user_id)
 
     if partner_id:
+        # сохраняем последнего собеседника для оценки
+        last_partner[user_id] = partner_id
+        last_partner[partner_id] = user_id
+
         pairs.pop(user_id, None)
         pairs.pop(partner_id, None)
         # можно очистить время чата, но не обязательно
         chat_start_time.pop(user_id, None)
         chat_start_time.pop(partner_id, None)
+
         bot.send_message(user_id, "❌ Вы завершили разговор.", reply_markup=main_keyboard())
         bot.send_message(partner_id, "❌ Собеседник завершил разговор.", reply_markup=main_keyboard())
+
+        # отправляем запрос на оценку обоим
+        send_rate_request(user_id)
+        send_rate_request(partner_id)
         return
 
     if user_id in waiting_users:
@@ -262,6 +328,8 @@ def handle_stop(message):
 
 @bot.message_handler(commands=["help"])
 def handle_help(message):
+    user_id = message.from_user.id
+    touch_user(user_id)
     bot.send_message(
         message.chat.id,
         "ℹ️ <b>Справка</b>\n\n"
@@ -269,7 +337,9 @@ def handle_help(message):
         "👨 Искать парня — искать только парней\n"
         "👩 Искать девушку — искать только девушек\n"
         "⛔ Стоп — завершить разговор или выйти из очереди\n"
-        "👤 Профиль /profile — посмотреть и изменить пол/возраст\n\n"
+        "👤 Профиль /profile — посмотреть и изменить пол/возраст\n"
+        "📊 Статистика — онлайн, очередь, активные чаты и ваш рейтинг\n\n"
+        "После завершения чата можно оценить собеседника 👍👎\n\n"
         "Первые 30 секунд диалога нельзя отправлять стикеры, GIF и видео.\n"
         "Запрещён порнографический контент.",
         reply_markup=main_keyboard()
@@ -279,8 +349,11 @@ def handle_help(message):
 @bot.message_handler(commands=["profile"])
 def handle_profile(message):
     user_id = message.from_user.id
+    touch_user(user_id)
     g = gender_to_text(user_gender.get(user_id))
     a = user_age.get(user_id)
+    likes = user_likes_received.get(user_id, 0)
+    dislikes = user_dislikes_received.get(user_id, 0)
 
     text = "👤 <b>Ваш профиль</b>\n\n"
     text += f"Пол: <b>{g}</b>\n"
@@ -289,6 +362,7 @@ def handle_profile(message):
     else:
         text += "Возраст: <b>не указан</b>\n"
 
+    text += f"Рейтинг: 👍 <b>{likes}</b> / 👎 <b>{dislikes}</b>\n"
     text += "\nВы можете изменить пол или возраст кнопками ниже."
 
     bot.send_message(
@@ -303,6 +377,7 @@ def handle_profile(message):
 @bot.message_handler(func=lambda m: m.text in ["👨 Я парень", "👩 Я девушка"])
 def handle_gender_select(message):
     user_id = message.from_user.id
+    touch_user(user_id)
 
     if message.text == "👨 Я парень":
         user_gender[user_id] = "M"
@@ -324,18 +399,55 @@ def handle_gender_select(message):
         )
 
 
+# ---------- ОБРАБОТКА ОЦЕНОК (INLINE-КНОПКИ) ----------
+
+@bot.callback_query_handler(func=lambda c: c.data in ["rate_like", "rate_dislike"])
+def handle_rating_callback(call):
+    user_id = call.from_user.id
+    touch_user(user_id)
+    partner_id = last_partner.get(user_id)
+
+    if not partner_id:
+        bot.answer_callback_query(call.id, "Пока некого оценивать 🙂")
+        return
+
+    if call.data == "rate_like":
+        user_likes_received[partner_id] = user_likes_received.get(partner_id, 0) + 1
+        msg = "Спасибо! 👍 Я учту ваш лайк."
+    else:
+        user_dislikes_received[partner_id] = user_dislikes_received.get(partner_id, 0) + 1
+        msg = "Спасибо за отзыв 👌"
+
+    # чтобы нельзя было оценивать по несколько раз
+    last_partner.pop(user_id, None)
+
+    # убираем кнопки у сообщения
+    try:
+        bot.edit_message_reply_markup(
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            reply_markup=None
+        )
+    except Exception:
+        pass
+
+    bot.answer_callback_query(call.id, "Оценка сохранена")
+    bot.send_message(user_id, msg)
+
+
 # ---------- ОБРАБОТКА ТЕКСТА ----------
 
 @bot.message_handler(content_types=["text"])
 def handle_text(message):
     user_id = message.from_user.id
     text = message.text
+    touch_user(user_id)
 
-    # <<< НОВОЕ: не трогаем команды, пусть их обрабатывают /start, /profile и т.д.
+    # не трогаем команды — у них свои хендлеры
     if text.startswith("/"):
         return
 
-    # <<< НОВОЕ: не обрабатываем тут кнопки выбора пола, для них есть отдельный хендлер
+    # не обрабатываем тут кнопки выбора пола, для них есть отдельный хендлер
     if text in ["👨 Я парень", "👩 Я девушка"]:
         return
 
@@ -364,7 +476,7 @@ def handle_text(message):
             )
         return
 
-    # --- кнопки поиска/меню/профиля ---
+    # --- кнопки поиска/меню/профиля/статистики ---
     if text == "🔍 Найти собеседника":
         start_search(user_id, message.chat.id, mode=None)
         return
@@ -382,6 +494,9 @@ def handle_text(message):
         return
     if text == "👤 Профиль":
         handle_profile(message)
+        return
+    if text == "📊 Статистика":
+        send_stats(user_id, message.chat.id)
         return
     if text == "🔄 Изменить пол":
         bot.send_message(
@@ -434,6 +549,7 @@ def handle_text(message):
 @bot.message_handler(content_types=["photo"])
 def handle_photo(message):
     user_id = message.from_user.id
+    touch_user(user_id)
     partner_id = get_partner(user_id)
 
     if not ensure_profile_complete(user_id, message.chat.id):
@@ -442,8 +558,6 @@ def handle_photo(message):
     if not partner_id:
         bot.send_message(user_id, "Сначала найдите собеседника.", reply_markup=main_keyboard())
         return
-
-    # фото разрешаем сразу, ограничение только для стикеров/гиф/видео по твоему запросу
 
     file_id = message.photo[-1].file_id
     try:
@@ -458,6 +572,7 @@ def handle_photo(message):
 @bot.message_handler(content_types=["sticker"])
 def handle_sticker(message):
     user_id = message.from_user.id
+    touch_user(user_id)
     partner_id = get_partner(user_id)
 
     if not ensure_profile_complete(user_id, message.chat.id):
@@ -483,6 +598,7 @@ def handle_sticker(message):
 @bot.message_handler(content_types=["video", "animation"])
 def handle_video_or_gif(message):
     user_id = message.from_user.id
+    touch_user(user_id)
     partner_id = get_partner(user_id)
 
     if not ensure_profile_complete(user_id, message.chat.id):
@@ -509,5 +625,5 @@ def handle_video_or_gif(message):
 
 
 if __name__ == "__main__":
-    print("Бот запущен (анонимный чат + пол + возраст + профиль + защита от спама)...")
+    print("Бот запущен (анонимный чат + пол + возраст + профиль + рейтинг + статистика)...")
     bot.infinity_polling()

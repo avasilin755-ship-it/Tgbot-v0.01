@@ -1,23 +1,24 @@
 import os
-import telebot
-from telebot import types  # клавиатуры
 import time
-
-# 👉 Токен берём из переменной окружения
-TOKEN = os.getenv("TOKEN")
-bot = telebot.TeleBot(TOKEN, parse_mode="HTML")
+import datetime
+import telebot
+from telebot import types
 
 # ---------- НАСТРОЙКИ ----------
+
+TOKEN = os.getenv("TOKEN")
+bot = telebot.TeleBot(TOKEN, parse_mode="HTML", threaded=True)
+
 REF_VIP_THRESHOLD = 3     # сколько приглашений нужно, чтобы показывать "VIP-очередь"
-ONLINE_WINDOW = 600       # окно для "онлайн" в секундах (10 минут)
+ONLINE_WINDOW = 600       # окно «онлайн» (секунд)
 
 # ---------- ХРАНИЛКИ СОСТОЯНИЯ ----------
 
-waiting_users = []              # список user_id
+waiting_users = []              # список user_id в ожидании
 pairs = {}                      # user_id -> partner_id
 user_gender = {}                # user_id -> "M"/"F"
 user_age = {}                   # user_id -> int
-desired_partner_gender = {}     # user_id -> None / "M" / "F"
+desired_partner_gender = {}     # user_id -> None/"M"/"F"
 waiting_for_age = set()         # user_id, от которых ждём возраст
 chat_start_time = {}            # user_id -> timestamp начала чата
 
@@ -30,7 +31,8 @@ last_seen = {}                  # user_id -> last activity timestamp
 ref_inviter = {}                # user_id -> inviter_id
 ref_count = {}                  # inviter_id -> int (сколько он привёл)
 
-# Простейший список слов для фильтрации порнографического контента
+_bot_username_cache = None      # кеш username бота
+
 BAD_WORDS = [
     "porn", "sex", "nude", "xxx",
     "порно", "секс", "голый", "голая", "голые",
@@ -38,11 +40,10 @@ BAD_WORDS = [
     "оральн", "анал", "анальный", "оральный",
 ]
 
-# ---------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ----------
+# ---------- УТИЛИТЫ ----------
 
 
 def touch_user(user_id: int) -> None:
-    """Обновляем время последней активности пользователя."""
     last_seen[user_id] = time.time()
 
 
@@ -51,63 +52,46 @@ def get_partner(user_id: int):
 
 
 def remove_from_waiting(user_id: int) -> None:
-    """Безопасно убираем пользователя из очереди."""
     try:
         waiting_users.remove(user_id)
     except ValueError:
         pass
 
 
+def log_event(tag: str, user_id: int, extra: str = ""):
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{now}] {tag} от {user_id} {extra}")
+
+
 def main_keyboard() -> types.ReplyKeyboardMarkup:
-    """Основная клавиатура."""
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
     kb.row(types.KeyboardButton("🔍 Найти собеседника"))
-    kb.row(
-        types.KeyboardButton("👨 Искать парня"),
-        types.KeyboardButton("👩 Искать девушку"),
-    )
-    kb.row(
-        types.KeyboardButton("⛔ Стоп"),
-        types.KeyboardButton("ℹ️ Помощь"),
-    )
-    kb.row(
-        types.KeyboardButton("👤 Профиль"),
-        types.KeyboardButton("📊 Статистика"),
-    )
+    kb.row(types.KeyboardButton("👨 Искать парня"), types.KeyboardButton("👩 Искать девушку"))
+    kb.row(types.KeyboardButton("⛔ Стоп"), types.KeyboardButton("ℹ️ Помощь"))
+    kb.row(types.KeyboardButton("👤 Профиль"), types.KeyboardButton("📊 Статистика"))
     kb.row(types.KeyboardButton("🎁 Бонусы"))
     return kb
 
 
 def gender_keyboard() -> types.ReplyKeyboardMarkup:
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
-    kb.row(
-        types.KeyboardButton("👨 Я парень"),
-        types.KeyboardButton("👩 Я девушка"),
-    )
+    kb.row(types.KeyboardButton("👨 Я парень"), types.KeyboardButton("👩 Я девушка"))
     return kb
 
 
 def profile_keyboard() -> types.ReplyKeyboardMarkup:
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.row(
-        types.KeyboardButton("🔄 Изменить пол"),
-        types.KeyboardButton("🎂 Изменить возраст"),
-    )
+    kb.row(types.KeyboardButton("🔄 Изменить пол"), types.KeyboardButton("🎂 Изменить возраст"))
     kb.row(types.KeyboardButton("⬅️ В меню"))
     return kb
 
 
 def ask_age(user_id: int, chat_id: int) -> None:
-    """Запрос возраста у пользователя."""
     waiting_for_age.add(user_id)
-    bot.send_message(
-        chat_id,
-        "Введите, пожалуйста, ваш возраст цифрой (например, 18):"
-    )
+    bot.send_message(chat_id, "Введите, пожалуйста, ваш возраст цифрой (например, 18):")
 
 
 def ensure_profile_complete(user_id: int, chat_id: int) -> bool:
-    """Проверяем, указан ли пол и возраст. Если нет — просим указать."""
     if user_id not in user_gender:
         bot.send_message(
             chat_id,
@@ -124,16 +108,13 @@ def ensure_profile_complete(user_id: int, chat_id: int) -> bool:
 
 
 def is_compatible(user_a: int, user_b: int) -> bool:
-    """Проверка по полу и желаемому полу."""
     ga = user_gender.get(user_a)
     gb = user_gender.get(user_b)
     da = desired_partner_gender.get(user_a)
     db = desired_partner_gender.get(user_b)
 
-    # если вдруг у кого-то не указан пол — допускаем
     if ga is None or gb is None:
         return True
-
     if da is not None and gb != da:
         return False
     if db is not None and ga != db:
@@ -141,13 +122,50 @@ def is_compatible(user_a: int, user_b: int) -> bool:
     return True
 
 
+def gender_to_text(g: str) -> str:
+    return {"M": "парень", "F": "девушка"}.get(g, "не указан")
+
+
+def can_send_media(user_id: int) -> bool:
+    start = chat_start_time.get(user_id)
+    if not start:
+        return True
+    return time.time() - start >= 30
+
+
+def contains_bad_words(text: str) -> bool:
+    t = text.lower()
+    return any(word in t for word in BAD_WORDS)
+
+
+def get_rating(user_id: int):
+    return user_likes_received.get(user_id, 0), user_dislikes_received.get(user_id, 0)
+
+
+def inc_like(user_id: int, delta: int = 1) -> None:
+    if delta > 0:
+        user_likes_received[user_id] = user_likes_received.get(user_id, 0) + delta
+
+
+def get_bot_username() -> str:
+    global _bot_username_cache
+    if _bot_username_cache is not None:
+        return _bot_username_cache
+    try:
+        _bot_username_cache = bot.get_me().username or "your_bot"
+    except Exception:
+        _bot_username_cache = "your_bot"
+    return _bot_username_cache
+
+
+def build_ref_link(user_id: int) -> str:
+    return f"https://t.me/{get_bot_username()}?start={user_id}"
+
+
+# ---------- ЛОГИКА ПОИСКА ----------
+
+
 def start_search(user_id: int, chat_id: int, mode=None) -> None:
-    """
-    mode:
-      None  -> любой пол
-      "M"   -> искать только парней
-      "F"   -> искать только девушек
-    """
     if not ensure_profile_complete(user_id, chat_id):
         return
 
@@ -168,9 +186,7 @@ def start_search(user_id: int, chat_id: int, mode=None) -> None:
             break
 
     if partner_id is not None:
-        # нашёлся подходящий собеседник
         remove_from_waiting(partner_id)
-
         pairs[user_id] = partner_id
         pairs[partner_id] = user_id
 
@@ -183,64 +199,25 @@ def start_search(user_id: int, chat_id: int, mode=None) -> None:
 
         bot.send_message(chat_id, "✅ Собеседник найден! Можете писать, отправлять фото и позже медиа.")
         bot.send_message(partner_id, "✅ Собеседник найден! Можете писать, отправлять фото и позже медиа.")
-    else:
-        # никого подходящего нет — встаём в очередь
-        waiting_users.append(user_id)
-        invites = ref_count.get(user_id, 0)
-        if invites >= REF_VIP_THRESHOLD:
-            text = (
-                "🚀 Вы в <b>VIP-очереди</b>! Как только появится подходящий собеседник — "
-                "я постараюсь соединить вас как можно быстрее 😉"
-            )
-        else:
-            text = "Вы в очереди. Как только появится подходящий собеседник — я соединю вас."
-        bot.send_message(chat_id, text)
-
-
-def gender_to_text(g: str) -> str:
-    return {"M": "парень", "F": "девушка"}.get(g, "не указан")
-
-
-def can_send_media(user_id: int) -> bool:
-    """Первые 30 секунд после начала диалога запрещаем медиа/стикеры/гиф/видео."""
-    start = chat_start_time.get(user_id)
-    if not start:
-        return True
-    return time.time() - start >= 30
-
-
-def contains_bad_words(text: str) -> bool:
-    """Проверяем, есть ли в тексте запрещённые слова."""
-    t = text.lower()
-    return any(word in t for word in BAD_WORDS)
-
-
-def get_rating(user_id: int):
-    """Возвращает (лайки, дизлайки) пользователя."""
-    return user_likes_received.get(user_id, 0), user_dislikes_received.get(user_id, 0)
-
-
-def inc_like(user_id: int, delta: int = 1) -> None:
-    """Увеличить лайки у пользователя."""
-    if delta <= 0:
         return
-    user_likes_received[user_id] = user_likes_received.get(user_id, 0) + delta
+
+    # Никого не нашли — встаём в очередь
+    waiting_users.append(user_id)
+    invites = ref_count.get(user_id, 0)
+    if invites >= REF_VIP_THRESHOLD:
+        text = (
+            "🚀 Вы в <b>VIP-очереди</b>! Как только появится подходящий собеседник — "
+            "я постараюсь соединить вас как можно быстрее 😉"
+        )
+    else:
+        text = "Вы в очереди. Как только появится подходящий собеседник — я соединю вас."
+    bot.send_message(chat_id, text)
 
 
-def get_bot_username() -> str:
-    """Безопасно получаем username бота для реф-ссылок."""
-    try:
-        return bot.get_me().username or "your_bot"
-    except Exception:
-        return "your_bot"
-
-
-def build_ref_link(user_id: int) -> str:
-    return f"https://t.me/{get_bot_username()}?start={user_id}"
+# ---------- ВСПОМОГАТЕЛЬНОЕ UI ----------
 
 
 def send_stats(user_id: int, chat_id: int) -> None:
-    """Отправка статистики: онлайн, очередь, активные чаты, рейтинг пользователя."""
     now = time.time()
     online = sum(1 for ts in last_seen.values() if now - ts < ONLINE_WINDOW)
     in_queue = len(waiting_users)
@@ -262,8 +239,8 @@ def send_stats(user_id: int, chat_id: int) -> None:
 
 
 def send_rate_request(user_id: int) -> None:
-    """Отправляем пользователю запрос оценить собеседника."""
-    if user_id not in last_partner:
+    partner_id = last_partner.get(user_id)
+    if not partner_id:
         return
     kb = types.InlineKeyboardMarkup()
     kb.add(
@@ -274,7 +251,6 @@ def send_rate_request(user_id: int) -> None:
 
 
 def send_bonus_info(user_id: int, chat_id: int) -> None:
-    """Информация о реферальной ссылке и приглашениях."""
     invites = ref_count.get(user_id, 0)
     likes, dislikes = get_rating(user_id)
     ref_link = build_ref_link(user_id)
@@ -284,9 +260,7 @@ def send_bonus_info(user_id: int, chat_id: int) -> None:
         vip_status = "✅ У вас активирован <b>VIP-статус</b> в очереди."
     else:
         remaining = max(REF_VIP_THRESHOLD - invites, 1)
-        vip_status = (
-            f"Чтобы получить <b>VIP-очередь</b>, пригласите ещё <b>{remaining}</b> человек(а)."
-        )
+        vip_status = f"Чтобы получить <b>VIP-очередь</b>, пригласите ещё <b>{remaining}</b> человек(а)."
 
     text = (
         "🎁 <b>Бонусы и приглашения</b>\n\n"
@@ -302,7 +276,6 @@ def send_bonus_info(user_id: int, chat_id: int) -> None:
 
 
 def send_leaderboard(chat_id: int, current_user_id: int) -> None:
-    """Лидерборд по приглашениям."""
     if not ref_count:
         bot.send_message(
             chat_id,
@@ -349,8 +322,9 @@ def handle_start(message):
     user_id = message.from_user.id
     chat_id = message.chat.id
     touch_user(user_id)
+    log_event("/start", user_id, message.text)
 
-    # --- РЕФЕРАЛЬНАЯ ЛОГИКА ---
+    # Реферальная логика
     parts = message.text.split(maxsplit=1)
     if len(parts) > 1:
         payload = parts[1]
@@ -360,7 +334,6 @@ def handle_start(message):
                 ref_inviter[user_id] = inviter_id
                 ref_count[inviter_id] = ref_count.get(inviter_id, 0) + 1
                 inc_like(inviter_id, 1)
-
                 invites = ref_count[inviter_id]
                 try:
                     bot.send_message(
@@ -374,7 +347,6 @@ def handle_start(message):
         except ValueError:
             pass
 
-    # --- ПРОФИЛЬ / ПРИВЕТСТВИЕ ---
     if user_id not in user_gender or user_id not in user_age:
         if user_id not in user_gender:
             bot.send_message(
@@ -383,10 +355,7 @@ def handle_start(message):
                 reply_markup=gender_keyboard()
             )
         else:
-            bot.send_message(
-                chat_id,
-                "Привет ещё раз! Осталось указать возраст.",
-            )
+            bot.send_message(chat_id, "Привет ещё раз! Осталось указать возраст.")
             ask_age(user_id, chat_id)
     else:
         bot.send_message(
@@ -404,10 +373,11 @@ def handle_stop(message):
     user_id = message.from_user.id
     chat_id = message.chat.id
     touch_user(user_id)
+    log_event("/stop", user_id)
+
     partner_id = get_partner(user_id)
 
     if partner_id:
-        # сохраняем последнего собеседника для оценки
         last_partner[user_id] = partner_id
         last_partner[partner_id] = user_id
 
@@ -419,7 +389,6 @@ def handle_stop(message):
         bot.send_message(user_id, "❌ Вы завершили разговор.", reply_markup=main_keyboard())
         bot.send_message(partner_id, "❌ Собеседник завершил разговор.", reply_markup=main_keyboard())
 
-        # запрос оценки
         send_rate_request(user_id)
         send_rate_request(partner_id)
         return
@@ -438,6 +407,7 @@ def handle_help(message):
     user_id = message.from_user.id
     chat_id = message.chat.id
     touch_user(user_id)
+    log_event("/help", user_id)
     bot.send_message(
         chat_id,
         "ℹ️ <b>Справка</b>\n\n"
@@ -461,6 +431,7 @@ def handle_profile(message):
     user_id = message.from_user.id
     chat_id = message.chat.id
     touch_user(user_id)
+    log_event("/profile", user_id)
     g = gender_to_text(user_gender.get(user_id))
     a = user_age.get(user_id)
     likes, dislikes = get_rating(user_id)
@@ -482,6 +453,7 @@ def handle_bonus(message):
     user_id = message.from_user.id
     chat_id = message.chat.id
     touch_user(user_id)
+    log_event("/bonus", user_id)
     send_bonus_info(user_id, chat_id)
 
 
@@ -490,10 +462,11 @@ def handle_top(message):
     user_id = message.from_user.id
     chat_id = message.chat.id
     touch_user(user_id)
+    log_event("/top", user_id)
     send_leaderboard(chat_id, user_id)
 
 
-# ---------- ВЫБОР ПОЛА (кнопки) ----------
+# ---------- ВЫБОР ПОЛА ----------
 
 
 @bot.message_handler(func=lambda m: m.text in ["👨 Я парень", "👩 Я девушка"])
@@ -501,20 +474,18 @@ def handle_gender_select(message):
     user_id = message.from_user.id
     chat_id = message.chat.id
     touch_user(user_id)
+    log_event("GENDER_SELECT", user_id, message.text)
 
     user_gender[user_id] = "M" if message.text == "👨 Я парень" else "F"
 
     if user_id not in user_age:
-        bot.send_message(
-            chat_id,
-            "Отлично, я запомнил 👍\nТеперь укажите ваш возраст.",
-        )
+        bot.send_message(chat_id, "Отлично, я запомнил 👍\nТеперь укажите ваш возраст.")
         ask_age(user_id, chat_id)
     else:
         bot.send_message(chat_id, "Пол обновлён 👍", reply_markup=main_keyboard())
 
 
-# ---------- ОЦЕНКА СОБЕСЕДНИКА (INLINE) ----------
+# ---------- ОЦЕНКА СОБЕСЕДНИКА ----------
 
 
 @bot.callback_query_handler(func=lambda c: c.data in ["rate_like", "rate_dislike"])
@@ -534,10 +505,8 @@ def handle_rating_callback(call):
         user_dislikes_received[partner_id] = user_dislikes_received.get(partner_id, 0) + 1
         msg = "Спасибо за отзыв 👌"
 
-    # запрет повторной оценки
     last_partner.pop(user_id, None)
 
-    # убираем кнопки у сообщения
     try:
         bot.edit_message_reply_markup(
             chat_id=call.message.chat.id,
@@ -551,7 +520,7 @@ def handle_rating_callback(call):
     bot.send_message(user_id, msg)
 
 
-# ---------- ОБРАБОТКА ТЕКСТА ----------
+# ---------- ТЕКСТ ----------
 
 
 @bot.message_handler(content_types=["text"])
@@ -560,30 +529,26 @@ def handle_text(message):
     chat_id = message.chat.id
     text = message.text
     touch_user(user_id)
+    log_event("TEXT", user_id, text)
 
-    # команды обрабатываются отдельно
     if text.startswith("/"):
         return
 
-    # Ввод возраста
+    # возраст
     if user_id in waiting_for_age:
         if text.isdigit():
             age = int(text)
             if 10 <= age <= 100:
                 user_age[user_id] = age
                 waiting_for_age.remove(user_id)
-                bot.send_message(
-                    chat_id,
-                    f"Возраст записан: {age} 🎂",
-                    reply_markup=main_keyboard()
-                )
+                bot.send_message(chat_id, f"Возраст записан: {age} 🎂", reply_markup=main_keyboard())
             else:
                 bot.send_message(chat_id, "Введите, пожалуйста, реальный возраст от 10 до 100:")
         else:
             bot.send_message(chat_id, "Возраст нужно ввести цифрами, например: 18")
         return
 
-    # Кнопки меню
+    # кнопки меню
     if text == "🔍 Найти собеседника":
         start_search(user_id, chat_id, mode=None)
         return
@@ -618,7 +583,7 @@ def handle_text(message):
         bot.send_message(chat_id, "Возврат в меню.", reply_markup=main_keyboard())
         return
 
-    # Обычные сообщения в чате
+    # обычные сообщения в чате
     if not ensure_profile_complete(user_id, chat_id):
         return
 
@@ -727,4 +692,4 @@ def handle_video_or_gif(message):
 
 if __name__ == "__main__":
     print("Бот запущен (анонимный чат + профиль + рейтинг + статистика + рефералка + лидерборд)...")
-    bot.infinity_polling()
+    bot.infinity_polling(none_stop=True)
